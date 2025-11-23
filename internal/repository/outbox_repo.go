@@ -13,9 +13,10 @@ import (
 )
 
 type OutboxRepository interface {
+	BeginTx(ctx context.Context) (*sql.Tx, error)
 	Save(ctx context.Context, tx *sql.Tx, event *domain.OutboxEvent) error
-	FetchPending(ctx context.Context, limit int) ([]*domain.OutboxEvent, error)
-	MarkProcessed(ctx context.Context, ids []uuid.UUID) error
+	FetchPending(ctx context.Context, tx *sql.Tx, limit int) ([]*domain.OutboxEvent, error)
+	MarkProcessed(ctx context.Context, tx *sql.Tx, ids []uuid.UUID) error
 }
 
 type PostgresOutboxRepository struct {
@@ -24,6 +25,10 @@ type PostgresOutboxRepository struct {
 
 func NewPostgresOutboxRepository(db *sql.DB) *PostgresOutboxRepository {
 	return &PostgresOutboxRepository{db: db}
+}
+
+func (r *PostgresOutboxRepository) BeginTx(ctx context.Context) (*sql.Tx, error) {
+	return r.db.BeginTx(ctx, nil)
 }
 
 func (r *PostgresOutboxRepository) Save(ctx context.Context, tx *sql.Tx, event *domain.OutboxEvent) error {
@@ -49,7 +54,7 @@ func (r *PostgresOutboxRepository) Save(ctx context.Context, tx *sql.Tx, event *
 	return nil
 }
 
-func (r *PostgresOutboxRepository) FetchPending(ctx context.Context, limit int) ([]*domain.OutboxEvent, error) {
+func (r *PostgresOutboxRepository) FetchPending(ctx context.Context, tx *sql.Tx, limit int) ([]*domain.OutboxEvent, error) {
 	query := `
 		SELECT id, event_type, payload, status, created_at
 		FROM outbox
@@ -59,7 +64,13 @@ func (r *PostgresOutboxRepository) FetchPending(ctx context.Context, limit int) 
 		FOR UPDATE SKIP LOCKED
 	`
 
-	rows, err := r.db.QueryContext(ctx, query, limit)
+	var rows *sql.Rows
+	var err error
+	if tx != nil {
+		rows, err = tx.QueryContext(ctx, query, limit)
+	} else {
+		rows, err = r.db.QueryContext(ctx, query, limit)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch pending events: %w", err)
 	}
@@ -76,7 +87,7 @@ func (r *PostgresOutboxRepository) FetchPending(ctx context.Context, limit int) 
 	return events, nil
 }
 
-func (r *PostgresOutboxRepository) MarkProcessed(ctx context.Context, ids []uuid.UUID) error {
+func (r *PostgresOutboxRepository) MarkProcessed(ctx context.Context, tx *sql.Tx, ids []uuid.UUID) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -87,7 +98,16 @@ func (r *PostgresOutboxRepository) MarkProcessed(ctx context.Context, ids []uuid
 		WHERE id = ANY($2)
 	`
 
-	_, err := r.db.ExecContext(ctx, query, time.Now(), pq.Array(ids))
+	var exec interface {
+		ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	}
+	if tx != nil {
+		exec = tx
+	} else {
+		exec = r.db
+	}
+
+	_, err := exec.ExecContext(ctx, query, time.Now(), pq.Array(ids))
 	if err != nil {
 		return fmt.Errorf("failed to mark events as processed: %w", err)
 	}

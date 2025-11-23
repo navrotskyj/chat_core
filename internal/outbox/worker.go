@@ -51,7 +51,15 @@ func (w *Worker) Stop() {
 }
 
 func (w *Worker) processBatch(ctx context.Context) {
-	events, err := w.repo.FetchPending(ctx, 50) // Batch size 50
+	// Start Transaction
+	tx, err := w.repo.BeginTx(ctx)
+	if err != nil {
+		log.Printf("Failed to begin transaction: %v", err)
+		return
+	}
+	defer tx.Rollback() // Rollback if not committed
+
+	events, err := w.repo.FetchPending(ctx, tx, 50) // Batch size 50
 	if err != nil {
 		log.Printf("Failed to fetch pending events: %v", err)
 		return
@@ -65,10 +73,7 @@ func (w *Worker) processBatch(ctx context.Context) {
 	for _, event := range events {
 		// Unmarshal payload to ensure it's valid JSON before publishing,
 		// although we store it as JSONB so it should be fine.
-		// We publish the raw payload or wrap it?
-		// Let's publish the whole event structure or just the payload?
-		// The requirement says "send message... confirm...".
-		// We'll publish the event structure so the consumer knows the event type.
+		// We publish the whole event structure so the consumer knows the event type.
 
 		// We need to unmarshal the payload to interface{} to pass to Publish,
 		// or we can just pass the raw message if we change Publish signature.
@@ -122,8 +127,13 @@ func (w *Worker) processBatch(ctx context.Context) {
 	}
 
 	if len(processedIDs) > 0 {
-		if err := w.repo.MarkProcessed(ctx, processedIDs); err != nil {
+		if err := w.repo.MarkProcessed(ctx, tx, processedIDs); err != nil {
 			log.Printf("Failed to mark events as processed: %v", err)
+			return
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit transaction: %v", err)
 	}
 }

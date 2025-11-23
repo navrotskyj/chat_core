@@ -15,6 +15,21 @@
             "args": [
                 "server"
             ]
+        },
+        {
+            "name": "server 2",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/chat-core",
+            "output": "${workspaceFolder}/bin/chat-core",
+            "envFile": "${workspaceRoot}/env",
+            "env": {
+                "PORT": "8081"
+            },
+            "args": [
+                "server"
+            ]
         }
     ]
 }
