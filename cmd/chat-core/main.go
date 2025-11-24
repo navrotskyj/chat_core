@@ -61,10 +61,10 @@ func main() {
 	defer mqClient.Close()
 
 	// 5. Outbox Worker
-	worker := outbox.NewWorker(outboxRepo, chatRepo, mqClient)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go worker.Start(ctx, 500*time.Millisecond)
+	outboxWorker := outbox.NewWorker(outboxRepo, chatRepo, mqClient, presenceRepo)
+	go outboxWorker.Start(ctx, 500*time.Millisecond)
 
 	// 6. WebSocket Hub
 	nodeID := uuid.New().String()
@@ -75,10 +75,28 @@ func main() {
 	pushWorker := push.NewWorker(mqClient)
 	go pushWorker.Start(ctx)
 
-	// 8. Cluster Broadcast (Consumer) - REMOVED
-	// The Hub now consumes user queues directly via mqClient.ConsumeUserQueue
+	// 8. Cache Invalidation Consumer
+	invalidationMsgs, err := mqClient.ConsumeBroadcast("cache.invalidate")
+	if err != nil {
+		log.Fatalf("Failed to start invalidation consumer: %v", err)
+	}
+	go func() {
+		for d := range invalidationMsgs {
+			var payload map[string]string
+			if err := json.Unmarshal(d.Body, &payload); err != nil {
+				log.Printf("Failed to unmarshal invalidation payload: %v", err)
+				continue
+			}
+			if chatIDStr, ok := payload["chat_id"]; ok {
+				if chatID, err := uuid.Parse(chatIDStr); err == nil {
+					chatRepo.Invalidate(chatID)
+					log.Printf("Cache invalidated for chat %s", chatID)
+				}
+			}
+		}
+	}()
 
-	// 8. HTTP Handlers
+	// 9. HTTP Handlers
 	// 8. HTTP Handlers
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		// WebSocket handshake doesn't strictly need CORS headers if CheckOrigin is true,
@@ -125,6 +143,46 @@ func main() {
 		go client.ReadPump()
 	})
 
+	http.HandleFunc("/messages/sync", enableCORS(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		chatIDStr := r.URL.Query().Get("chat_id")
+		afterIDStr := r.URL.Query().Get("after_id")
+
+		if chatIDStr == "" {
+			http.Error(w, "Missing chat_id", http.StatusBadRequest)
+			return
+		}
+
+		chatID, err := uuid.Parse(chatIDStr)
+		if err != nil {
+			http.Error(w, "Invalid chat_id", http.StatusBadRequest)
+			return
+		}
+
+		var afterID uuid.UUID
+		if afterIDStr != "" {
+			afterID, _ = uuid.Parse(afterIDStr)
+		}
+
+		messages, err := chatRepo.GetMessagesAfter(r.Context(), chatID, afterID, 50)
+		if err != nil {
+			log.Printf("Failed to sync messages: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		if messages == nil {
+			messages = []*domain.Message{}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(messages)
+	}))
+
 	http.HandleFunc("/messages", enableCORS(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -156,10 +214,52 @@ func main() {
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
-		if err := chatRepo.EnsureChatMember(r.Context(), msg.ChatID, msg.SenderID); err != nil {
+
+		added, err := chatRepo.EnsureChatMember(r.Context(), msg.ChatID, msg.SenderID)
+		if err != nil {
 			log.Printf("Failed to ensure member: %v", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
+		}
+
+		// If user was newly added, publish USER_JOINED event
+		if added {
+			// Invalidate cache first
+			go func() {
+				invalidationPayload := map[string]string{"chat_id": msg.ChatID.String()}
+				if err := mqClient.Publish(context.Background(), "cache.invalidate", invalidationPayload); err != nil {
+					log.Printf("Failed to publish cache invalidation: %v", err)
+				}
+			}()
+
+			// Publish USER_JOINED
+			go func() {
+				// We reuse the Outbox logic? Or direct publish?
+				// Ideally via Outbox for reliability.
+				// But we don't have a handy "CreateEvent" method exposed in main.
+				// Let's just create an outbox event manually using outboxRepo.
+				// Wait, outboxRepo is available here.
+
+				payload, _ := json.Marshal(map[string]interface{}{
+					"chat_id": msg.ChatID,
+					"user_id": msg.SenderID,
+				})
+
+				event := &domain.OutboxEvent{
+
+					ID:        uuid.New(),
+					EventType: domain.EventTypeUserJoined,
+					Payload:   payload,
+					CreatedAt: time.Now(),
+				}
+
+				// We need a transaction? Ideally yes, but for now separate is okay-ish.
+				// Actually, we can't easily use the same tx as EnsureChatMember because that method manages its own tx (implicit).
+				// So we just save it.
+				if err := outboxRepo.Save(context.Background(), nil, event); err != nil {
+					log.Printf("Failed to save USER_JOINED event: %v", err)
+				}
+			}()
 		}
 
 		if err := chatRepo.CreateMessage(r.Context(), &msg); err != nil {

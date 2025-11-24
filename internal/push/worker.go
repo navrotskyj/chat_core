@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"strings"
 
 	"chat_core/internal/broker"
 	"chat_core/internal/domain"
@@ -51,23 +52,31 @@ func (w *Worker) Start(ctx context.Context) {
 					continue
 				}
 
-				// The routing key of the dead-lettered message tells us the user!
-				// We check the "x-death" header which contains detailed info about the dead-lettering.
-				// Although d.RoutingKey usually preserves the original key, x-death is the source of truth.
-
-				targetUser := d.RoutingKey
-
-				if headers, ok := d.Headers["x-death"].([]interface{}); ok && len(headers) > 0 {
-					if table, ok := headers[0].(amqp.Table); ok {
-						if rk, ok := table["routing-keys"].([]interface{}); ok && len(rk) > 0 {
-							if key, ok := rk[0].(string); ok {
-								targetUser = key
+				// Extract User ID from Routing Key
+				// Format: user.{userID}
+				routingKey := d.RoutingKey
+				if !strings.HasPrefix(routingKey, "user.") {
+					// Try x-death if routing key is not what we expect (just in case)
+					if headers, ok := d.Headers["x-death"].([]interface{}); ok && len(headers) > 0 {
+						if header, ok := headers[0].(amqp.Table); ok {
+							if rk, ok := header["routing-keys"].([]interface{}); ok && len(rk) > 0 {
+								if s, ok := rk[0].(string); ok {
+									routingKey = s
+								}
 							}
 						}
 					}
 				}
 
-				log.Printf("[PUSH] Sending push to %s: %s (Expired in queue)", targetUser, msg.Content)
+				if !strings.HasPrefix(routingKey, "user.") {
+					log.Printf("Skipping push: invalid routing key %s", routingKey)
+					d.Ack(false)
+					continue
+				}
+
+				userID := strings.TrimPrefix(routingKey, "user.")
+
+				log.Printf("[PUSH] Sending push to %s: %s (Expired in queue)", userID, msg.Content)
 			}
 			d.Ack(false)
 		}

@@ -63,26 +63,26 @@ func NewRabbitMQClient(url string) (*RabbitMQClient, error) {
 	}, nil
 }
 
-func (c *RabbitMQClient) Publish(ctx context.Context, routingKey string, payload interface{}) error {
-	body, err := json.Marshal(payload)
+func (c *RabbitMQClient) Publish(ctx context.Context, routingKey string, body interface{}) error {
+	return c.PublishToExchange(ctx, ExchangeTopic, routingKey, body)
+}
+
+func (c *RabbitMQClient) PublishToExchange(ctx context.Context, exchange, routingKey string, body interface{}) error {
+	bytes, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("failed to marshal payload: %w", err)
+		return fmt.Errorf("failed to marshal body: %w", err)
 	}
 
-	err = c.channel.PublishWithContext(ctx,
-		ExchangeTopic, // exchange
-		routingKey,    // routing key
-		false,         // mandatory
-		false,         // immediate
+	return c.channel.PublishWithContext(ctx,
+		exchange,   // exchange
+		routingKey, // routing key
+		false,      // mandatory
+		false,      // immediate
 		amqp.Publishing{
 			ContentType: "application/json",
-			Body:        body,
-		})
-	if err != nil {
-		return fmt.Errorf("failed to publish message: %w", err)
-	}
-
-	return nil
+			Body:        bytes,
+		},
+	)
 }
 
 func (c *RabbitMQClient) Close() {
@@ -195,5 +195,36 @@ func (c *RabbitMQClient) ConsumePushQueue() (<-chan amqp.Delivery, error) {
 
 	return c.channel.Consume(
 		q.Name, "", false, false, false, false, nil,
+	)
+}
+
+// ConsumeBroadcast creates a temporary exclusive queue bound to the exchange with a specific routing key.
+// This is used for broadcasting events to ALL nodes (e.g. cache invalidation).
+func (c *RabbitMQClient) ConsumeBroadcast(routingKey string) (<-chan amqp.Delivery, error) {
+	q, err := c.channel.QueueDeclare(
+		"",    // name (empty = random auto-generated)
+		false, // durable
+		true,  // delete when unused
+		true,  // exclusive (only this connection can read)
+		false, // no-wait
+		nil,   // arguments
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to declare broadcast queue: %w", err)
+	}
+
+	err = c.channel.QueueBind(
+		q.Name,        // queue name
+		routingKey,    // routing key
+		ExchangeTopic, // exchange
+		false,
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to bind broadcast queue: %w", err)
+	}
+
+	return c.channel.Consume(
+		q.Name, "", true, false, false, false, nil,
 	)
 }

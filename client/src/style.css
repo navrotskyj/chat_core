@@ -24,3 +24,16 @@ body {
 #app {
   width: 100%;
 }
+
+.message-wrapper.system {
+  justify-content: center;
+  margin: 10px 0;
+}
+
+.system-message {
+  background-color: rgba(255, 255, 255, 0.1);
+  color: #aaa;
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-size: 0.85em;
+}

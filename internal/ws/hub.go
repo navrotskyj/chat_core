@@ -137,7 +137,10 @@ func (h *Hub) BroadcastToUser(userID uuid.UUID, message interface{}) {
 		return
 	}
 
-	data, err := json.Marshal(message)
+	data, err := json.Marshal(map[string]any{
+		"type":    "MESSAGE_CREATED",
+		"payload": message,
+	})
 	if err != nil {
 		log.Printf("Failed to marshal message: %v", err)
 		return
