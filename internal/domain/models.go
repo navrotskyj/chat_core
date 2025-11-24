@@ -51,4 +51,5 @@ const (
 	EventTypeUserLeft         = "USER_LEFT"
 	EventTypeMessageRead      = "MESSAGE_READ"
 	EventTypeMessageDelivered = "MESSAGE_DELIVERED"
+	EventTypeUserTyping       = "USER_TYPING"
 )

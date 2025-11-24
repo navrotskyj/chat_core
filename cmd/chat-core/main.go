@@ -282,6 +282,29 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	}))
 
+	http.HandleFunc("/chats/typing", enableCORS(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			ChatID uuid.UUID `json:"chat_id"`
+			UserID uuid.UUID `json:"user_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if err := chatRepo.SendTyping(r.Context(), req.ChatID, req.UserID); err != nil {
+			log.Printf("Failed to send typing event: %v", err)
+			// Don't fail the request hard for typing indicators, just log
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+
 	http.HandleFunc("/messages", enableCORS(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)

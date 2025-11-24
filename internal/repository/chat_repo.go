@@ -340,3 +340,25 @@ func (r *ChatRepository) MarkMessagesDelivered(ctx context.Context, chatID, user
 
 	return tx.Commit()
 }
+
+func (r *ChatRepository) SendTyping(ctx context.Context, chatID, userID uuid.UUID) error {
+	payload := map[string]interface{}{
+		"chat_id": chatID,
+		"user_id": userID,
+	}
+	payloadBytes, _ := json.Marshal(payload)
+
+	event := &domain.OutboxEvent{
+		ID:        uuid.New(),
+		EventType: domain.EventTypeUserTyping,
+		Payload:   payloadBytes,
+		CreatedAt: time.Now(),
+	}
+
+	// Pass nil for tx since typing events are ephemeral and don't need DB consistency
+	if err := r.outboxRepo.Save(ctx, nil, event); err != nil {
+		return fmt.Errorf("failed to save typing event: %w", err)
+	}
+
+	return nil
+}

@@ -103,11 +103,24 @@ const connect = () => {
         if (chatId.value === payload.chat_id) {
            messages.value.forEach(m => {
              if (m.sender_id !== userId.value) return
-             console.log('Marking message as delivered', m)
              if (m.status === 'sent') { // Assuming 'sent' is the initial status for outgoing messages
                 m.status = 'delivered'
              }
            })
+        }
+      } else if (data.type === 'USER_TYPING') {
+        const payload = data.payload
+        if (chatId.value === payload.chat_id && payload.user_id !== userId.value) {
+           // We need username. For now use ID or fetch from members
+           const member = members.value.find(m => m.id === payload.user_id)
+           const username = member ? member.username : `User ${payload.user_id.slice(0,8)}`
+           
+           typingUsers.value.set(payload.user_id, username)
+           
+           // Clear after 3 seconds
+           setTimeout(() => {
+             typingUsers.value.delete(payload.user_id)
+           }, 3000)
         }
       }
     } catch (e) {
@@ -155,6 +168,32 @@ const markDelivered = async (chatId, messageId) => {
     })
   } catch (e) {
     console.error("Failed to send delivery receipt", e)
+  }
+}
+
+const typingUsers = ref(new Map()) // userId -> username
+let typingTimeout = null
+
+const handleTyping = () => {
+  if (typingTimeout) clearTimeout(typingTimeout)
+  typingTimeout = setTimeout(() => {
+    sendTyping()
+  }, 300) // Debounce sending typing event
+}
+
+const sendTyping = async () => {
+  if (!userId.value || !chatId.value) return
+  try {
+    await fetch('http://localhost:8080/chats/typing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId.value,
+        user_id: userId.value
+      })
+    })
+  } catch (e) {
+    console.error("Failed to send typing event", e)
   }
 }
 
@@ -309,10 +348,15 @@ onUnmounted(() => {
         </div>
       </div>
       
+      <div v-if="typingUsers.size > 0" class="typing-indicator">
+        {{ Array.from(typingUsers.values()).join(', ') }} is typing...
+      </div>
+
       <div class="input-area">
         <input 
           v-model="newMessage" 
           @keyup.enter="sendMessage" 
+          @input="handleTyping"
           type="text" 
           placeholder="Type a message..." 
           :disabled="!isConnected"
@@ -521,7 +565,14 @@ header {
   flex: 1;
 }
 
-.input-area .btn-primary {
-  width: auto;
+.input-area .text-gray-400 {
+  color: #9ca3af;
+}
+
+.typing-indicator {
+  padding: 5px 10px;
+  font-size: 0.8em;
+  color: #666;
+  font-style: italic;
 }
 </style>
