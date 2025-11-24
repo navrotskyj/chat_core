@@ -39,12 +39,15 @@ func (r *ChatRepository) CreateMessage(ctx context.Context, msg *domain.Message)
 
 	// 1. Insert Message
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO messages (id, chat_id, sender_id, content, created_at)
-		VALUES ($1, $2, $3, $4, $5)
-	`, msg.ID, msg.ChatID, msg.SenderID, msg.Content, msg.CreatedAt)
+		INSERT INTO messages (id, chat_id, sender_id, content, status, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`, msg.ID, msg.ChatID, msg.SenderID, msg.Content, "sent", msg.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to insert message: %w", err)
 	}
+
+	// Set status on the struct so it's included in the event payload
+	msg.Status = "sent"
 
 	// 2. Create Outbox Event
 	payload, err := json.Marshal(msg)
@@ -132,7 +135,7 @@ func (r *ChatRepository) GetMessagesAfter(ctx context.Context, chatID uuid.UUID,
 		// Let's do: SELECT * FROM messages WHERE chat_id = $1 ORDER BY created_at DESC LIMIT $2
 		// And then reverse in code.
 		query := `
-			SELECT id, chat_id, sender_id, content, created_at
+			SELECT id, chat_id, sender_id, content, status, created_at
 			FROM messages
 			WHERE chat_id = $1
 			ORDER BY created_at DESC
@@ -145,7 +148,7 @@ func (r *ChatRepository) GetMessagesAfter(ctx context.Context, chatID uuid.UUID,
 		// or just use the ID if we assume monotonic IDs (UUIDv7) or just join.
 		// Let's use a subquery for simplicity: created_at > (SELECT created_at FROM messages WHERE id = $2)
 		query := `
-			SELECT id, chat_id, sender_id, content, created_at
+			SELECT id, chat_id, sender_id, content, status, created_at
 			FROM messages
 			WHERE chat_id = $1
 			  AND created_at > (SELECT created_at FROM messages WHERE id = $2)
@@ -163,7 +166,7 @@ func (r *ChatRepository) GetMessagesAfter(ctx context.Context, chatID uuid.UUID,
 	var messages []*domain.Message
 	for rows.Next() {
 		var msg domain.Message
-		if err := rows.Scan(&msg.ID, &msg.ChatID, &msg.SenderID, &msg.Content, &msg.CreatedAt); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.ChatID, &msg.SenderID, &msg.Content, &msg.Status, &msg.CreatedAt); err != nil {
 			return nil, err
 		}
 		messages = append(messages, &msg)
@@ -288,6 +291,51 @@ func (r *ChatRepository) MarkMessagesRead(ctx context.Context, chatID, userID, l
 
 	if err := r.outboxRepo.Save(ctx, tx, event); err != nil {
 		return fmt.Errorf("failed to save read event: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+func (r *ChatRepository) MarkMessagesDelivered(ctx context.Context, chatID, userID, lastMessageID uuid.UUID) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Insert/Update receipts to 'delivered' if they are not already 'read' or 'delivered'
+	query := `
+		INSERT INTO message_receipts (user_id, message_id, status, updated_at)
+		SELECT $1, id, 'delivered', NOW()
+		FROM messages
+		WHERE chat_id = $2 
+		  AND created_at <= (SELECT created_at FROM messages WHERE id = $3)
+		  AND sender_id != $1
+		ON CONFLICT (user_id, message_id) 
+		DO UPDATE SET status = 'delivered', updated_at = NOW()
+		WHERE message_receipts.status != 'read' AND message_receipts.status != 'delivered'
+	`
+	_, err = tx.ExecContext(ctx, query, userID, chatID, lastMessageID)
+	if err != nil {
+		return fmt.Errorf("failed to update receipts: %w", err)
+	}
+
+	payload := map[string]interface{}{
+		"chat_id":                   chatID,
+		"user_id":                   userID,
+		"last_delivered_message_id": lastMessageID,
+	}
+	payloadBytes, _ := json.Marshal(payload)
+
+	event := &domain.OutboxEvent{
+		ID:        uuid.New(),
+		EventType: domain.EventTypeMessageDelivered,
+		Payload:   payloadBytes,
+		CreatedAt: time.Now(),
+	}
+
+	if err := r.outboxRepo.Save(ctx, tx, event); err != nil {
+		return fmt.Errorf("failed to save delivered event: %w", err)
 	}
 
 	return tx.Commit()

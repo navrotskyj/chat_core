@@ -32,6 +32,7 @@ type Message struct {
 	ChatID    uuid.UUID `json:"chat_id"`
 	SenderID  uuid.UUID `json:"sender_id"`
 	Content   string    `json:"content"`
+	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -45,8 +46,9 @@ type OutboxEvent struct {
 }
 
 const (
-	EventTypeMessageCreated = "MESSAGE_CREATED"
-	EventTypeUserJoined     = "USER_JOINED"
-	EventTypeUserLeft       = "USER_LEFT"
-	EventTypeMessageRead    = "MESSAGE_READ"
+	EventTypeMessageCreated   = "MESSAGE_CREATED"
+	EventTypeUserJoined       = "USER_JOINED"
+	EventTypeUserLeft         = "USER_LEFT"
+	EventTypeMessageRead      = "MESSAGE_READ"
+	EventTypeMessageDelivered = "MESSAGE_DELIVERED"
 )

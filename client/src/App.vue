@@ -67,6 +67,9 @@ const connect = () => {
           console.log('Pushing to messages')
           messages.value.push(msg)
           scrollToBottom()
+          if (msg.sender_id !== userId.value) {
+             markDelivered(msg.chat_id, msg.id)
+          }
         } else {
           console.log('Duplicate message ignored')
         }
@@ -80,24 +83,31 @@ const connect = () => {
           created_at: new Date().toISOString()
         })
         scrollToBottom()
-        fetchMembers() // Refresh members list
+        fetchMembers(chatId.value) // Refresh members list, pass chatId
       } else if (data.type === 'MESSAGE_READ') {
+        const payload = JSON.parse(atob(data.payload))
+        // Update status of messages in this chat up to last_read_message_id
+        if (chatId.value === payload.chat_id) {
+           // Find the message to get its timestamp (or index)
+           // Simpler: just mark all messages in this chat as read if they are ours
+           // In a real app, we'd check timestamps or IDs.
+           // For now, let's just mark all "sent" or "delivered" messages as "read"
+           messages.value.forEach(m => {
+             if (m.sender_id !== userId.value) return // Only update own messages status
+             // In real app, check m.id <= payload.last_read_message_id
+             m.status = 'read'
+           })
+        }
+      } else if (data.type === 'MESSAGE_DELIVERED') {
         const payload = data.payload
-        // Update status of messages sent by ME that are <= last_read_message_id
-        // We don't have message IDs ordered easily, but we can iterate.
-        // Or we just mark all my messages as read if they are older than created_at of that message?
-        // Payload has last_read_message_id.
-        // We need to find that message to get its time, or just iterate all.
-        // Simple approach: Mark ALL my messages as read (since we don't have partial read logic fully synced yet)
-        // Better: Find the message with last_read_message_id, get its index, and mark all before it as read.
-        
-        const lastReadMsg = messages.value.find(m => m.id === payload.last_read_message_id)
-        if (lastReadMsg) {
-             messages.value.forEach(m => {
-                 if (m.sender_id === userId.value && new Date(m.created_at) <= new Date(lastReadMsg.created_at)) {
-                     m.status = 'read'
-                 }
-             })
+        if (chatId.value === payload.chat_id) {
+           messages.value.forEach(m => {
+             if (m.sender_id !== userId.value) return
+             console.log('Marking message as delivered', m)
+             if (m.status === 'sent') { // Assuming 'sent' is the initial status for outgoing messages
+                m.status = 'delivered'
+             }
+           })
         }
       }
     } catch (e) {
@@ -128,6 +138,23 @@ const fetchMembers = async () => {
     }
   } catch (e) {
     console.error('Failed to fetch members:', e)
+  }
+}
+
+const markDelivered = async (chatId, messageId) => {
+  if (!userId.value) return
+  try {
+    await fetch('http://localhost:8080/messages/delivered', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        user_id: userId.value,
+        last_message_id: messageId
+      })
+    })
+  } catch (e) {
+    console.error("Failed to send delivery receipt", e)
   }
 }
 
@@ -272,10 +299,10 @@ onUnmounted(() => {
             <div class="content">{{ msg.content }}</div>
             <div class="meta">
               <span class="time">{{ new Date(msg.created_at).toLocaleTimeString() }}</span>
-              <span v-if="msg.sender_id === userId" class="status-icon">
-                <span v-if="msg.status === 'read'">✓✓</span>
-                <span v-else-if="msg.status === 'delivered'">✓✓</span> <!-- We don't distinguish delivered yet in UI logic easily without ack -->
-                <span v-else>✓</span>
+              <span v-if="msg.sender_id === userId" class="text-xs ml-1">
+                <span v-if="msg.status === 'read'" class="text-blue-500">✓✓</span>
+                <span v-else-if="msg.status === 'delivered'" class="text-gray-500">✓✓</span>
+                <span v-else class="text-gray-400">✓</span>
               </span>
             </div>
           </div>

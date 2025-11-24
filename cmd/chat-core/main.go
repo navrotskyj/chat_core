@@ -257,6 +257,31 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	}))
 
+	http.HandleFunc("/messages/delivered", enableCORS(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			ChatID        uuid.UUID `json:"chat_id"`
+			UserID        uuid.UUID `json:"user_id"`
+			LastMessageID uuid.UUID `json:"last_message_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if err := chatRepo.MarkMessagesDelivered(r.Context(), req.ChatID, req.UserID, req.LastMessageID); err != nil {
+			log.Printf("Failed to mark messages delivered: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+
 	http.HandleFunc("/messages", enableCORS(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
