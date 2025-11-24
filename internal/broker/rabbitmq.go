@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"strings"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/rabbitmq/rabbitmq-stream-go-client/pkg/stream"
 )
 
 const (
@@ -14,12 +17,18 @@ const (
 )
 
 type RabbitMQClient struct {
-	conn    *amqp.Connection
-	channel *amqp.Channel
+	conn      *amqp.Connection
+	channel   *amqp.Channel
+	StreamEnv *stream.Environment
 }
 
-func NewRabbitMQClient(url string) (*RabbitMQClient, error) {
-	conn, err := amqp.Dial(url)
+func NewRabbitMQClient(uri string) (*RabbitMQClient, error) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse uri: %w", err)
+	}
+
+	conn, err := amqp.Dial(uri)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to rabbitmq: %w", err)
 	}
@@ -57,9 +66,38 @@ func NewRabbitMQClient(url string) (*RabbitMQClient, error) {
 		return nil, fmt.Errorf("failed to declare push exchange: %w", err)
 	}
 
+	// 3. Initialize Stream Environment
+	// We assume default port 5552 for streams if not specified.
+	// For simplicity in this demo, we hardcode the stream connection options or derive from url.
+	// The library handles "rabbitmq-stream://" urls.
+	// If we are using "amqp://guest:guest@localhost:5672/", we might need to adjust.
+	// Let's try to connect to localhost:5552 with guest/guest by default.
+
+	pass, _ := u.User.Password()
+
+	streamEnv, err := stream.NewEnvironment(
+		stream.NewEnvironmentOptions().
+			SetHost(strings.Split(u.Host, ":")[0]).
+			SetPort(5552).
+			SetUser(u.User.Username()).
+			SetPassword(pass).
+			SetAddressResolver(stream.AddressResolver{
+				Host: "10.9.8.111",
+				Port: 5552,
+			}),
+	)
+	if err != nil {
+		// Log warning but don't fail if streams are not available?
+		// Or fail? The user wants streams.
+		// Let's fail if we can't connect.
+		// Actually, let's log and return error.
+		return nil, fmt.Errorf("failed to initialize stream environment: %w", err)
+	}
+
 	return &RabbitMQClient{
-		conn:    conn,
-		channel: ch,
+		conn:      conn,
+		channel:   ch,
+		StreamEnv: streamEnv,
 	}, nil
 }
 
@@ -86,6 +124,9 @@ func (c *RabbitMQClient) PublishToExchange(ctx context.Context, exchange, routin
 }
 
 func (c *RabbitMQClient) Close() {
+	if c.StreamEnv != nil {
+		c.StreamEnv.Close()
+	}
 	if c.channel != nil {
 		c.channel.Close()
 	}
@@ -226,5 +267,39 @@ func (c *RabbitMQClient) ConsumeBroadcast(routingKey string) (<-chan amqp.Delive
 
 	return c.channel.Consume(
 		q.Name, "", true, false, false, false, nil,
+	)
+}
+
+// DeclareStream declares a RabbitMQ Stream (which is technically a queue with x-queue-type: stream).
+// DeclareStream declares a RabbitMQ Stream using the native client.
+func (c *RabbitMQClient) DeclareStream(name string) error {
+	return c.StreamEnv.DeclareStream(
+		name,
+		stream.NewStreamOptions().
+			SetMaxLengthBytes(stream.ByteCapacity{}.GB(2)), // Example: 2GB limit
+	)
+}
+
+// Consume starts consuming from a queue (or stream).
+func (c *RabbitMQClient) Consume(queue string) (<-chan amqp.Delivery, error) {
+	// For streams, we might want to set Qos
+	if err := c.channel.Qos(
+		100,   // prefetch count
+		0,     // prefetch size
+		false, // global
+	); err != nil {
+		return nil, fmt.Errorf("failed to set QoS: %w", err)
+	}
+
+	return c.channel.Consume(
+		queue, // queue
+		"",    // consumer
+		false, // auto-ack (we use manual ack)
+		false, // exclusive
+		false, // no-local
+		false, // no-wait
+		amqp.Table{
+			"x-stream-offset": "next", // Start from now for streams
+		},
 	)
 }

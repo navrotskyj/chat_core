@@ -13,189 +13,128 @@ import (
 	"chat_core/internal/repository"
 
 	"github.com/google/uuid"
+	"github.com/rabbitmq/rabbitmq-stream-go-client/pkg/amqp"
+	"github.com/rabbitmq/rabbitmq-stream-go-client/pkg/stream"
 )
 
-type Worker struct {
-	repo         repository.OutboxRepository
-	chatRepo     *repository.ChatRepository
+type StreamConsumer struct {
 	broker       *broker.RabbitMQClient
+	chatRepo     *repository.ChatRepository
 	presenceRepo presence.Repository
-	stop         chan struct{}
+	streamName   string
 }
 
-func NewWorker(repo repository.OutboxRepository, chatRepo *repository.ChatRepository, broker *broker.RabbitMQClient, presenceRepo presence.Repository) *Worker {
-	return &Worker{
-		repo:         repo,
-		chatRepo:     chatRepo,
+func NewStreamConsumer(broker *broker.RabbitMQClient, chatRepo *repository.ChatRepository, presenceRepo presence.Repository, streamName string) *StreamConsumer {
+	return &StreamConsumer{
 		broker:       broker,
+		chatRepo:     chatRepo,
 		presenceRepo: presenceRepo,
-		stop:         make(chan struct{}),
+		streamName:   streamName,
 	}
 }
 
-func (w *Worker) Start(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-w.stop:
-			return
-		case <-ticker.C:
-			w.processBatch(ctx)
-		}
-	}
-}
-
-func (w *Worker) Stop() {
-	close(w.stop)
-}
-
-func (w *Worker) processBatch(ctx context.Context) {
-	// Start Transaction
-	tx, err := w.repo.BeginTx(ctx)
+func (c *StreamConsumer) Start(ctx context.Context) error {
+	// Consume from Stream using Native Client
+	consumer, err := c.broker.StreamEnv.NewConsumer(
+		c.streamName,
+		func(consumerContext stream.ConsumerContext, message *amqp.Message) {
+			c.processMessage(ctx, message)
+		},
+		stream.NewConsumerOptions().
+			SetOffset(stream.OffsetSpecification{}.First()), // Start from beginning for now, or Last()
+	)
 	if err != nil {
-		log.Printf("Failed to begin transaction: %v", err)
+		return fmt.Errorf("failed to start stream consumer: %w", err)
+	}
+	defer consumer.Close()
+
+	log.Printf("Stream Consumer started on %s", c.streamName)
+
+	<-ctx.Done()
+	return nil
+}
+
+func (c *StreamConsumer) processMessage(ctx context.Context, msg *amqp.Message) {
+	// Payload structure from RabbitMQStreamOutboxRepository
+	var event struct {
+		ID        uuid.UUID       `json:"id"`
+		EventType string          `json:"event_type"`
+		Payload   json.RawMessage `json:"payload"`
+		CreatedAt time.Time       `json:"created_at"`
+	}
+
+	if err := json.Unmarshal(msg.GetData(), &event); err != nil {
+		log.Printf("Failed to unmarshal stream event: %v", err)
 		return
 	}
-	defer tx.Rollback() // Rollback if not committed
 
-	events, err := w.repo.FetchPending(ctx, tx, 50) // Batch size 50
+	// Fanout Logic (Same as before)
+
+	// 1. Unmarshal Payload to get ChatID
+	var message domain.Message
+	if err := json.Unmarshal(event.Payload, &message); err != nil {
+		// It might be a USER_JOINED event or something else
+		if event.EventType == domain.EventTypeUserJoined {
+			// Handle User Joined Fanout?
+			// For now let's just log and skip if not a message
+			// Or we can implement generic fanout if payload has chat_id
+		}
+		// If we can't parse as message, maybe we can parse as map to get chat_id
+		var generic map[string]interface{}
+		if err := json.Unmarshal(event.Payload, &generic); err == nil {
+			if chatIDStr, ok := generic["chat_id"].(string); ok {
+				message.ChatID, _ = uuid.Parse(chatIDStr)
+			}
+		}
+	}
+
+	if message.ChatID == uuid.Nil {
+		// Skip if no chat ID
+	}
+
+	// 2. Get Members
+	members, err := c.chatRepo.GetChatMembers(ctx, message.ChatID)
 	if err != nil {
-		log.Printf("Failed to fetch pending events: %v", err)
+		log.Printf("Failed to get chat members: %v", err)
 		return
 	}
 
-	if len(events) == 0 {
-		return
+	// Prepare WS Message
+	// We want to send the original event payload wrapped in {type, payload}
+	// The event.Payload is already the inner object (e.g. Message)
+	// We want to send: { type: "MESSAGE_CREATED", payload: {...} }
+
+	// We need to unmarshal event.Payload to interface{} to wrap it
+	var payloadObj interface{}
+	json.Unmarshal(event.Payload, &payloadObj)
+
+	wsMsg := struct {
+		Type    string      `json:"type"`
+		Payload interface{} `json:"payload"`
+	}{
+		Type:    event.EventType,
+		Payload: payloadObj,
 	}
 
-	var processedIDs []uuid.UUID
-	for _, event := range events {
-		// Unmarshal payload to ensure it's valid JSON before publishing,
-		// although we store it as JSONB so it should be fine.
-		// We publish the whole event structure so the consumer knows the event type.
-
-		// We need to unmarshal the payload to interface{} to pass to Publish,
-		// or we can just pass the raw message if we change Publish signature.
-		// But Publish takes interface{} and marshals it.
-		// Let's unmarshal the RawMessage to interface{}
-		var payload interface{}
-		if err := json.Unmarshal(event.Payload, &payload); err != nil {
-			log.Printf("Failed to unmarshal payload for event %s: %v", event.ID, err)
-			continue
-		}
-
-		// Construct a message to publish
-		msg := struct {
-			Type    string      `json:"type"`
-			Payload interface{} `json:"payload"`
-		}{
-			Type:    event.EventType,
-			Payload: payload,
-		}
-
-		// Fanout logic:
-		// 1. Get Chat Members
-		// 2. Publish to each member's routing key: user.{userID}
-
-		// We need to extract ChatID from payload.
-		// This assumes payload is domain.Message.
-		// Ideally we should store metadata in outbox event or have a generic way.
-		// For now, let's unmarshal to Message to get ChatID.
-		var message domain.Message
-		if err := json.Unmarshal(event.Payload, &message); err != nil {
-			log.Printf("Failed to unmarshal message for fanout: %v", err)
-			continue
-		}
-
-		members, err := w.chatRepo.GetChatMembers(ctx, message.ChatID)
+	for _, memberID := range members {
+		// Check Presence
+		isOnline, err := c.presenceRepo.IsUserOnline(ctx, memberID)
 		if err != nil {
-			log.Printf("Failed to get chat members: %v", err)
-			continue
+			log.Printf("Failed to check presence: %v", err)
+			isOnline = true // Fallback to try WS
 		}
 
-		for _, memberID := range members {
-			// Check if user is online
-			isOnline, err := w.presenceRepo.IsUserOnline(ctx, memberID)
-			if err != nil {
-				log.Printf("Failed to check presence for user %s: %v", memberID, err)
-				// Fallback to assuming offline? Or online?
-				// Let's assume offline to be safe and send push?
-				// Or assume online to try WS?
-				// Let's try WS as it has DLX anyway (if we kept DLX on user queue).
-				// But user asked to revert to immediate push if offline.
-				// So if error, let's try WS queue.
-				isOnline = true
+		if isOnline {
+			routingKey := fmt.Sprintf("user.%s", memberID)
+			if err := c.broker.Publish(ctx, routingKey, wsMsg); err != nil {
+				log.Printf("Failed to publish to WS queue %s: %v", routingKey, err)
 			}
-
-			if isOnline {
-				// User is online (or error), send to their queue
-				routingKey := fmt.Sprintf("user.%s", memberID)
-
-				// Debug log
-				log.Printf("Publishing to %s: Type=%s Payload=%+v", routingKey, msg.Type, msg.Payload)
-
-				if err := w.broker.Publish(ctx, routingKey, msg); err != nil {
-					log.Printf("Failed to publish event %s to %s: %v", event.ID, routingKey, err)
-				}
-			} else {
-				// User is offline, send IMMEDIATE push
-				// We publish to the Push Exchange directly
-				// We need to pass the recipient ID so the Push Worker knows who to send to.
-				// We can use headers for this.
-
-				// We need a PublishWithHeaders method or similar.
-				// The current Publish method doesn't support headers.
-				// We need to update RabbitMQClient or add a new method.
-				// Let's check RabbitMQClient.
-
-				// Wait, I can't see RabbitMQClient definition right now but I recall it takes (ctx, routingKey, body).
-				// I should add PublishWithHeaders to RabbitMQClient.
-				// For now, I will assume I need to add it.
-
-				// Actually, let's just use a special routing key or payload wrapper?
-				// Payload wrapper is easier without changing interface.
-				// But Push Worker expects the original message payload usually.
-
-				// Let's add PublishPush method to broker?
-				// Or just update Publish to accept options?
-
-				// Let's modify RabbitMQClient to support headers.
-				// But first let's mark this spot and go update RabbitMQClient.
-
-				// TEMPORARY: I will use a hack. I will wrap the payload in a struct that PushWorker understands?
-				// No, PushWorker reads x-death headers for DLX.
-				// For direct push, I can put the user ID in the routing key?
-				// The Push Exchange is FANOUT, so routing key is ignored by queues binding to it.
-				// BUT the consumer receives the routing key!
-				// So I can publish to `chat.push` with routing key `user.{userID}`.
-				// The Push Worker consumes from `push_notifications` queue which binds to `chat.push` with `#`.
-				// So it will receive the message and the routing key will be preserved!
-
-				// YES! I can just use the routing key `user.{userID}` when publishing to `chat.push`.
-				// The Push Worker just needs to parse the routing key.
-
-				routingKey := fmt.Sprintf("user.%s", memberID)
-				if err := w.broker.PublishToExchange(ctx, "chat.push", routingKey, msg); err != nil {
-					log.Printf("Failed to publish push for %s: %v", memberID, err)
-				}
+		} else {
+			// Offline -> Push
+			routingKey := fmt.Sprintf("user.%s", memberID)
+			if err := c.broker.PublishToExchange(ctx, "chat.push", routingKey, wsMsg); err != nil {
+				log.Printf("Failed to publish push for %s: %v", memberID, err)
 			}
 		}
-
-		processedIDs = append(processedIDs, event.ID)
-	}
-
-	if len(processedIDs) > 0 {
-		if err := w.repo.MarkProcessed(ctx, tx, processedIDs); err != nil {
-			log.Printf("Failed to mark events as processed: %v", err)
-			return
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit transaction: %v", err)
 	}
 }

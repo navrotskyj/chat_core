@@ -112,37 +112,18 @@ func (h *Hub) Run() {
 
 func (h *Hub) handleUserMessages(userID uuid.UUID, msgs <-chan amqp.Delivery) {
 	for d := range msgs {
-		var event struct {
-			Type    string          `json:"type"`
-			Payload json.RawMessage `json:"payload"`
-		}
-		if err := json.Unmarshal(d.Body, &event); err != nil {
-			log.Printf("Failed to unmarshal event: %v", err)
-			continue
-		}
-
-		if event.Type == "MESSAGE_CREATED" { // Hardcoded for now or import domain
-			// Forward to all devices of this user
-			h.BroadcastToUser(userID, event.Payload) // Payload is the message
-		}
+		// Forward raw message to all devices of this user
+		// The message from RabbitMQ is already in the correct format: { "type": "...", "payload": ... }
+		h.BroadcastRawToUser(userID, d.Body)
 	}
 }
 
-func (h *Hub) BroadcastToUser(userID uuid.UUID, message interface{}) {
+func (h *Hub) BroadcastRawToUser(userID uuid.UUID, data []byte) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
 	userClients, ok := h.clients[userID]
 	if !ok {
-		return
-	}
-
-	data, err := json.Marshal(map[string]any{
-		"type":    "MESSAGE_CREATED",
-		"payload": message,
-	})
-	if err != nil {
-		log.Printf("Failed to marshal message: %v", err)
 		return
 	}
 
@@ -157,7 +138,13 @@ func (h *Hub) BroadcastToUser(userID uuid.UUID, message interface{}) {
 }
 
 func (h *Hub) BroadcastToChat(members []uuid.UUID, message interface{}) {
+	// Helper to broadcast a struct to a chat (if needed internally)
+	data, err := json.Marshal(message)
+	if err != nil {
+		log.Printf("Failed to marshal message: %v", err)
+		return
+	}
 	for _, userID := range members {
-		h.BroadcastToUser(userID, message)
+		h.BroadcastRawToUser(userID, data)
 	}
 }

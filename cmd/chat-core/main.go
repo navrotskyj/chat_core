@@ -49,22 +49,42 @@ func main() {
 	defer db.Close()
 
 	// 3. Repositories
-	outboxRepo := repository.NewPostgresOutboxRepository(db)
-	chatRepo := repository.NewChatRepository(db)
-	presenceRepo := presence.NewPostgresRepository(db)
-
-	// 4. RabbitMQ
+	// 3. RabbitMQ
 	mqClient, err := broker.NewRabbitMQClient(amqpURL)
 	if err != nil {
 		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
 	}
 	defer mqClient.Close()
 
-	// 5. Outbox Worker
+	// 3. Declare Stream
+	streamName := "chat_events"
+	if err := mqClient.DeclareStream(streamName); err != nil {
+		log.Fatalf("Failed to declare stream: %v", err)
+	}
+
+	// 4. Repositories
+	// We use RabbitMQ Stream as Outbox
+	outboxRepo, err := repository.NewRabbitMQStreamOutboxRepository(mqClient, streamName)
+	if err != nil {
+		log.Fatalf("Failed to create outbox repo: %v", err)
+	}
+	// We still need PostgresOutboxRepository for manual event creation if needed?
+	// Or we just use the stream one everywhere.
+	// But wait, ChatRepository needs it.
+
+	chatRepo := repository.NewChatRepository(db, outboxRepo)
+	presenceRepo := presence.NewPostgresRepository(db)
+
+	// 5. Stream Consumer (Replaces Outbox Worker)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	outboxWorker := outbox.NewWorker(outboxRepo, chatRepo, mqClient, presenceRepo)
-	go outboxWorker.Start(ctx, 500*time.Millisecond)
+
+	streamConsumer := outbox.NewStreamConsumer(mqClient, chatRepo, presenceRepo, streamName)
+	go func() {
+		if err := streamConsumer.Start(ctx); err != nil {
+			log.Printf("Stream consumer failed: %v", err)
+		}
+	}()
 
 	// 6. WebSocket Hub
 	nodeID := uuid.New().String()
@@ -181,6 +201,60 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(messages)
+	}))
+
+	http.HandleFunc("/chats/members", enableCORS(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		chatIDStr := r.URL.Query().Get("chat_id")
+		if chatIDStr == "" {
+			http.Error(w, "Missing chat_id", http.StatusBadRequest)
+			return
+		}
+
+		chatID, err := uuid.Parse(chatIDStr)
+		if err != nil {
+			http.Error(w, "Invalid chat_id", http.StatusBadRequest)
+			return
+		}
+
+		members, err := chatRepo.GetChatMembersDetails(r.Context(), chatID)
+		if err != nil {
+			log.Printf("Failed to get members: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(members)
+	}))
+
+	http.HandleFunc("/messages/read", enableCORS(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			ChatID        uuid.UUID `json:"chat_id"`
+			UserID        uuid.UUID `json:"user_id"`
+			LastMessageID uuid.UUID `json:"last_message_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if err := chatRepo.MarkMessagesRead(r.Context(), req.ChatID, req.UserID, req.LastMessageID); err != nil {
+			log.Printf("Failed to mark messages read: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
 	}))
 
 	http.HandleFunc("/messages", enableCORS(func(w http.ResponseWriter, r *http.Request) {

@@ -3,13 +3,15 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
-	"time"
 
+	"chat_core/internal/broker"
 	"chat_core/internal/domain"
 
 	"github.com/google/uuid"
-	"github.com/lib/pq"
+	"github.com/rabbitmq/rabbitmq-stream-go-client/pkg/amqp"
+	"github.com/rabbitmq/rabbitmq-stream-go-client/pkg/stream"
 )
 
 type OutboxRepository interface {
@@ -19,97 +21,59 @@ type OutboxRepository interface {
 	MarkProcessed(ctx context.Context, tx *sql.Tx, ids []uuid.UUID) error
 }
 
-type PostgresOutboxRepository struct {
-	db *sql.DB
+// ... Postgres implementation ...
+
+// RabbitMQStreamOutboxRepository publishes events directly to a RabbitMQ Stream.
+type RabbitMQStreamOutboxRepository struct {
+	producer *stream.Producer
 }
 
-func NewPostgresOutboxRepository(db *sql.DB) *PostgresOutboxRepository {
-	return &PostgresOutboxRepository{db: db}
-}
-
-func (r *PostgresOutboxRepository) BeginTx(ctx context.Context) (*sql.Tx, error) {
-	return r.db.BeginTx(ctx, nil)
-}
-
-func (r *PostgresOutboxRepository) Save(ctx context.Context, tx *sql.Tx, event *domain.OutboxEvent) error {
-	query := `
-		INSERT INTO outbox (id, event_type, payload, status, created_at)
-		VALUES ($1, $2, $3, $4, $5)
-	`
-
-	// Use provided transaction if available, otherwise use db
-	var exec interface {
-		ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-	}
-	if tx != nil {
-		exec = tx
-	} else {
-		exec = r.db
-	}
-
-	_, err := exec.ExecContext(ctx, query, event.ID, event.EventType, event.Payload, "pending", event.CreatedAt)
+func NewRabbitMQStreamOutboxRepository(client *broker.RabbitMQClient, streamName string) (*RabbitMQStreamOutboxRepository, error) {
+	producer, err := client.StreamEnv.NewProducer(streamName, stream.NewProducerOptions())
 	if err != nil {
-		return fmt.Errorf("failed to insert outbox event: %w", err)
+		return nil, fmt.Errorf("failed to create stream producer: %w", err)
 	}
+	return &RabbitMQStreamOutboxRepository{
+		producer: producer,
+	}, nil
+}
+
+func (r *RabbitMQStreamOutboxRepository) BeginTx(ctx context.Context) (*sql.Tx, error) {
+	// We don't support SQL transactions for RabbitMQ, but we need to satisfy the interface.
+	// In a real hybrid setup, we might return a DB tx here if we were also writing to DB.
+	// For now, return nil which indicates "no transaction" or handle gracefully in Save.
+	return nil, nil
+}
+
+func (r *RabbitMQStreamOutboxRepository) Save(ctx context.Context, tx *sql.Tx, event *domain.OutboxEvent) error {
+	// We publish directly to the stream.
+	// Note: This is not transactional with the DB tx!
+	// Dual-write problem exists here.
+
+	payloadBytes, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("failed to marshal event: %w", err)
+	}
+
+	// Create AMQP 1.0 message for Stream
+	msg := amqp.NewMessage(payloadBytes)
+
+	// We can set properties if needed
+	// msg.SetApplicationProperties(...)
+
+	if err := r.producer.Send(msg); err != nil {
+		return fmt.Errorf("failed to publish to stream: %w", err)
+	}
+
 	return nil
 }
 
-func (r *PostgresOutboxRepository) FetchPending(ctx context.Context, tx *sql.Tx, limit int) ([]*domain.OutboxEvent, error) {
-	query := `
-		SELECT id, event_type, payload, status, created_at
-		FROM outbox
-		WHERE status = 'pending'
-		ORDER BY created_at ASC
-		LIMIT $1
-		FOR UPDATE SKIP LOCKED
-	`
-
-	var rows *sql.Rows
-	var err error
-	if tx != nil {
-		rows, err = tx.QueryContext(ctx, query, limit)
-	} else {
-		rows, err = r.db.QueryContext(ctx, query, limit)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch pending events: %w", err)
-	}
-	defer rows.Close()
-
-	var events []*domain.OutboxEvent
-	for rows.Next() {
-		var event domain.OutboxEvent
-		if err := rows.Scan(&event.ID, &event.EventType, &event.Payload, &event.Status, &event.CreatedAt); err != nil {
-			return nil, fmt.Errorf("failed to scan event: %w", err)
-		}
-		events = append(events, &event)
-	}
-	return events, nil
+func (r *RabbitMQStreamOutboxRepository) FetchPending(ctx context.Context, tx *sql.Tx, limit int) ([]*domain.OutboxEvent, error) {
+	// Not used in Stream mode (Push model, not Pull)
+	return nil, nil
 }
 
-func (r *PostgresOutboxRepository) MarkProcessed(ctx context.Context, tx *sql.Tx, ids []uuid.UUID) error {
-	if len(ids) == 0 {
-		return nil
-	}
-
-	query := `
-		UPDATE outbox
-		SET status = 'processed', processed_at = $1
-		WHERE id = ANY($2)
-	`
-
-	var exec interface {
-		ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-	}
-	if tx != nil {
-		exec = tx
-	} else {
-		exec = r.db
-	}
-
-	_, err := exec.ExecContext(ctx, query, time.Now(), pq.Array(ids))
-	if err != nil {
-		return fmt.Errorf("failed to mark events as processed: %w", err)
-	}
+func (r *RabbitMQStreamOutboxRepository) MarkProcessed(ctx context.Context, tx *sql.Tx, ids []uuid.UUID) error {
+	// Not used in Stream mode
 	return nil
 }

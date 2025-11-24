@@ -14,12 +14,16 @@ import (
 )
 
 type ChatRepository struct {
-	db    *sql.DB
-	cache sync.Map // map[uuid.UUID][]uuid.UUID
+	db         *sql.DB
+	outboxRepo OutboxRepository
+	cache      sync.Map // map[uuid.UUID][]uuid.UUID
 }
 
-func NewChatRepository(db *sql.DB) *ChatRepository {
-	return &ChatRepository{db: db}
+func NewChatRepository(db *sql.DB, outboxRepo OutboxRepository) *ChatRepository {
+	return &ChatRepository{
+		db:         db,
+		outboxRepo: outboxRepo,
+	}
 }
 
 func (r *ChatRepository) Invalidate(chatID uuid.UUID) {
@@ -48,7 +52,6 @@ func (r *ChatRepository) CreateMessage(ctx context.Context, msg *domain.Message)
 		return fmt.Errorf("failed to marshal message payload: %w", err)
 	}
 
-	outboxRepo := &PostgresOutboxRepository{db: r.db} // We can reuse the struct logic but pass tx
 	event := &domain.OutboxEvent{
 		ID:        uuid.New(),
 		EventType: domain.EventTypeMessageCreated,
@@ -56,7 +59,7 @@ func (r *ChatRepository) CreateMessage(ctx context.Context, msg *domain.Message)
 		CreatedAt: time.Now(),
 	}
 
-	if err := outboxRepo.Save(ctx, tx, event); err != nil {
+	if err := r.outboxRepo.Save(ctx, tx, event); err != nil {
 		return fmt.Errorf("failed to save outbox event: %w", err)
 	}
 
@@ -89,6 +92,30 @@ func (r *ChatRepository) GetChatMembers(ctx context.Context, chatID uuid.UUID) (
 	r.cache.Store(chatID, members)
 
 	return members, nil
+}
+
+func (r *ChatRepository) GetChatMembersDetails(ctx context.Context, chatID uuid.UUID) ([]domain.User, error) {
+	query := `
+		SELECT u.id, u.username 
+		FROM chat_members cm
+		JOIN users u ON cm.user_id = u.id
+		WHERE cm.chat_id = $1
+	`
+	rows, err := r.db.QueryContext(ctx, query, chatID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch chat members details: %w", err)
+	}
+	defer rows.Close()
+
+	var users []domain.User
+	for rows.Next() {
+		var u domain.User
+		if err := rows.Scan(&u.ID, &u.Username); err != nil {
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	return users, nil
 }
 
 func (r *ChatRepository) GetMessagesAfter(ctx context.Context, chatID uuid.UUID, afterID uuid.UUID, limit int) ([]*domain.Message, error) {
@@ -191,4 +218,77 @@ func (r *ChatRepository) EnsureChatMember(ctx context.Context, chatID, userID uu
 	}
 
 	return rowsAffected > 0, nil
+}
+
+func (r *ChatRepository) MarkMessagesRead(ctx context.Context, chatID, userID, lastMessageID uuid.UUID) error {
+	// 1. Update messages status in messages table (for sender to see)
+	// We only update messages sent by OTHERS in this chat, which are older than or equal to lastMessageID
+	// AND are not yet read.
+
+	// Actually, the `status` column in `messages` table is usually for the *sender* to see if *everyone* read it?
+	// Or is it just a simple "at least one person read it"?
+	// For 1-on-1, it's simple. For groups, it's complex.
+	// Let's assume 1-on-1 or "anyone read it" for simplicity as per "Telegram-like" usually implies per-user receipts but simple UI.
+	// But wait, I added `message_receipts` table.
+
+	// 1. Insert/Update into message_receipts
+	// We need to find all messages in this chat up to lastMessageID that this user hasn't read yet.
+	// Then insert receipts.
+	// This might be heavy if we do it one by one.
+	// Let's just update the receipts for now.
+
+	// Optimization: Just insert a "cursor" receipt?
+	// "User X read chat Y up to Message Z".
+	// But we want per-message status for the UI (checkmarks).
+
+	// Let's do a bulk insert/update for receipts.
+	// "INSERT INTO message_receipts ... SELECT id FROM messages WHERE chat_id=$1 AND id <= $2 ..."
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// A. Insert/Update receipts
+	query := `
+		INSERT INTO message_receipts (user_id, message_id, status, updated_at)
+		SELECT $1, id, 'read', NOW()
+		FROM messages
+		WHERE chat_id = $2 
+		  AND created_at <= (SELECT created_at FROM messages WHERE id = $3)
+		  AND sender_id != $1 -- Don't mark own messages as read by self
+		ON CONFLICT (user_id, message_id) 
+		DO UPDATE SET status = 'read', updated_at = NOW()
+		WHERE message_receipts.status != 'read'
+	`
+	_, err = tx.ExecContext(ctx, query, userID, chatID, lastMessageID)
+	if err != nil {
+		return fmt.Errorf("failed to update receipts: %w", err)
+	}
+
+	// B. Publish Event
+	// We want to notify the sender(s) that their messages were read.
+	// Ideally we publish one event "User X read chat Y up to Z".
+	// The clients can then update UI.
+
+	payload := map[string]interface{}{
+		"chat_id":              chatID,
+		"user_id":              userID,
+		"last_read_message_id": lastMessageID,
+	}
+	payloadBytes, _ := json.Marshal(payload)
+
+	event := &domain.OutboxEvent{
+		ID:        uuid.New(),
+		EventType: "MESSAGE_READ", // We need to add this const
+		Payload:   payloadBytes,
+		CreatedAt: time.Now(),
+	}
+
+	if err := r.outboxRepo.Save(ctx, tx, event); err != nil {
+		return fmt.Errorf("failed to save read event: %w", err)
+	}
+
+	return tx.Commit()
 }

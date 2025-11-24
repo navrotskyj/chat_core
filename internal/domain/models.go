@@ -48,4 +48,5 @@ const (
 	EventTypeMessageCreated = "MESSAGE_CREATED"
 	EventTypeUserJoined     = "USER_JOINED"
 	EventTypeUserLeft       = "USER_LEFT"
+	EventTypeMessageRead    = "MESSAGE_READ"
 )

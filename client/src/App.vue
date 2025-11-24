@@ -44,6 +44,8 @@ const connect = () => {
     
     // Sync messages
     syncMessages()
+    // Fetch members
+    fetchMembers()
   }
 
   socket.value.onmessage = (event) => {
@@ -78,6 +80,25 @@ const connect = () => {
           created_at: new Date().toISOString()
         })
         scrollToBottom()
+        fetchMembers() // Refresh members list
+      } else if (data.type === 'MESSAGE_READ') {
+        const payload = data.payload
+        // Update status of messages sent by ME that are <= last_read_message_id
+        // We don't have message IDs ordered easily, but we can iterate.
+        // Or we just mark all my messages as read if they are older than created_at of that message?
+        // Payload has last_read_message_id.
+        // We need to find that message to get its time, or just iterate all.
+        // Simple approach: Mark ALL my messages as read (since we don't have partial read logic fully synced yet)
+        // Better: Find the message with last_read_message_id, get its index, and mark all before it as read.
+        
+        const lastReadMsg = messages.value.find(m => m.id === payload.last_read_message_id)
+        if (lastReadMsg) {
+             messages.value.forEach(m => {
+                 if (m.sender_id === userId.value && new Date(m.created_at) <= new Date(lastReadMsg.created_at)) {
+                     m.status = 'read'
+                 }
+             })
+        }
       }
     } catch (e) {
       console.error('Failed to parse message:', e)
@@ -93,6 +114,20 @@ const connect = () => {
 
   socket.value.onerror = (error) => {
     console.error('WebSocket error', error)
+  }
+}
+
+const members = ref([])
+
+const fetchMembers = async () => {
+  if (!chatId.value) return
+  try {
+    const response = await fetch(`http://localhost:8080/chats/members?chat_id=${chatId.value}`)
+    if (response.ok) {
+      members.value = await response.json()
+    }
+  } catch (e) {
+    console.error('Failed to fetch members:', e)
   }
 }
 
@@ -224,23 +259,29 @@ onUnmounted(() => {
       </header>
 
       <div class="messages" ref="messagesContainer">
-        <div v-for="msg in messages" :key="msg.id" 
-             class="message-wrapper" 
-             :class="{ 
-               'own': msg.sender_id === userId,
-               'system': msg.type === 'system'
-             }">
+        <div 
+          v-for="msg in messages" 
+          :key="msg.id" 
+          :class="['message-bubble', msg.sender_id === userId ? 'my-message' : '']"
+        >
           <div v-if="msg.type === 'system'" class="system-message">
             {{ msg.content }}
           </div>
-          <div v-else class="message-bubble">
+          <div v-else>
             <div class="sender" v-if="msg.sender_id !== userId">{{ msg.sender_id.slice(0, 8) }}</div>
             <div class="content">{{ msg.content }}</div>
-            <div class="time">{{ new Date(msg.created_at).toLocaleTimeString() }}</div>
+            <div class="meta">
+              <span class="time">{{ new Date(msg.created_at).toLocaleTimeString() }}</span>
+              <span v-if="msg.sender_id === userId" class="status-icon">
+                <span v-if="msg.status === 'read'">✓✓</span>
+                <span v-else-if="msg.status === 'delivered'">✓✓</span> <!-- We don't distinguish delivered yet in UI logic easily without ack -->
+                <span v-else>✓</span>
+              </span>
+            </div>
           </div>
         </div>
       </div>
-
+      
       <div class="input-area">
         <input 
           v-model="newMessage" 
@@ -251,6 +292,16 @@ onUnmounted(() => {
         />
         <button @click="sendMessage" :disabled="!isConnected || !newMessage">Send</button>
       </div>
+    </div>
+    
+    <div v-if="isLoggedIn" class="members-sidebar">
+      <h3>Members</h3>
+      <ul>
+        <li v-for="member in members" :key="member.id">
+          {{ member.username || member.id.slice(0, 8) }}
+          <span v-if="member.id === userId">(You)</span>
+        </li>
+      </ul>
     </div>
   </div>
 </template>
@@ -264,8 +315,36 @@ onUnmounted(() => {
   background-color: #1a1a1a;
   color: #ffffff;
   font-family: 'Inter', sans-serif;
+  gap: 20px;
 }
 
+.members-sidebar {
+  width: 200px;
+  background: #2a2a2a;
+  padding: 1rem;
+  border-radius: 12px;
+  height: 80vh;
+  overflow-y: auto;
+}
+
+.members-sidebar h3 {
+  margin-top: 0;
+  border-bottom: 1px solid #444;
+  padding-bottom: 0.5rem;
+}
+
+.members-sidebar ul {
+  list-style: none;
+  padding: 0;
+}
+
+.members-sidebar li {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #333;
+  font-size: 0.9rem;
+}
+
+/* ... existing styles ... */
 .login-card {
   background: #2a2a2a;
   padding: 2rem;
